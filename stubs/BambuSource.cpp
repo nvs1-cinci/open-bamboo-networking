@@ -9,11 +9,16 @@
 //     Protocol is the 80-byte auth packet + 16-byte frame headers
 //     documented in OpenBambuAPI/video.md and implemented below.
 //
-//   * RTSPS on port 322 - used by X1 / P1S / P2S. The RTSP demux,
-//     H.264 decode, and MJPEG transcode happens behind the
-//     IVideoPipeline interface (see stubs/video_pipeline.hpp). The
-//     concrete backend is selected at compile time by
-//     -DOBN_VIDEO_BACKEND=ffmpeg (default) or =gstreamer.
+//   * RTSPS on port 322 - used by X1 / P1S / P2S / N7. The RTSP/RTSPS
+//     handshake plus RTP-H.264 depacketisation lives in
+//     stubs/rtsp_client.cpp; stubs/rtsp_passthrough.cpp wraps that in
+//     a worker thread that hands Annex-B-framed access units to the
+//     C ABI. We do NOT decode or transcode: gstbambusrc.c (vendored
+//     verbatim by both Bambu Studio and Orca Slicer on Linux) feeds
+//     whatever Bambu_ReadSample returns into h264parse + avdec_h264 /
+//     openh264dec / vaapih264dec, so the slicer-side pipeline does
+//     all the heavy lifting and we stay free of any in-process
+//     libavcodec dependency.
 //
 // URL formats we accept (all three appear in Studio's source):
 //
@@ -23,8 +28,8 @@
 //
 //   bambu:///rtsps___<user>:<passwd>@<ip>/streaming/live/1?proto=rtsps
 //   bambu:///rtsp___<user>:<passwd>@<ip>/streaming/live/1?proto=rtsp
-//       -> RTSP(S) on port 322 (X1/P1S/P2S firmware protocol); routed
-//          through IVideoPipeline (FFmpeg or GStreamer backend).
+//       -> RTSP(S) on port 322 (X1/P1S/P2S/N7 firmware protocol);
+//          routed through obn::rtsp::Passthrough (raw H.264 byte stream).
 //
 // Any extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...)
 // are ignored. The printer only cares about the auth packet (MJPG) or
@@ -100,7 +105,7 @@
 #include "obn/zip_reader.hpp"
 
 #include "source_log.hpp"
-#include "video_pipeline.hpp"
+#include "rtsp_passthrough.hpp"
 
 #if defined(_WIN32)
 #    define OBN_EXPORT extern "C" __declspec(dllexport)
@@ -169,10 +174,10 @@ using Logger = void (*)(void* context, int level, tchar const* msg);
 
 // -----------------------------------------------------------------------
 // All log/last-error helpers live in stubs/source_log.{hpp,cpp} so the
-// video backends and the macOS BambuPlayer wrapper can share them. We
-// pull the names into the anonymous namespace below so existing call
-// sites (`log_fmt`, `log_at`, `mirror_log_fp`, `set_last_error`,
-// `LL_DEBUG`, ...) keep compiling unchanged.
+// RTSP client and FTPS bridge can share them. We pull the names into
+// the anonymous namespace below so existing call sites (`log_fmt`,
+// `log_at`, `mirror_log_fp`, `set_last_error`, `LL_DEBUG`, ...) keep
+// compiling unchanged.
 // -----------------------------------------------------------------------
 
 namespace {
@@ -438,14 +443,18 @@ struct Tunnel {
     SSL*             ssl     = nullptr;
 
     // ---- RTSP(S) state (Scheme::Rtsps/Rtsp) ----
-    // Owned video pipeline (FFmpeg or GStreamer; see video_pipeline.hpp).
-    // Built lazily by open_rtsp(); destroyed by tunnel_close().
-    std::unique_ptr<obn::video::IVideoPipeline> video_pipe;
+    // Custom RTSP/RTSPS client wrapped by an Annex-B passthrough
+    // worker (rtsp_passthrough.hpp). Built lazily by open_rtsp();
+    // destroyed by tunnel_close(). Hands raw H.264 byte-stream
+    // straight to gstbambusrc, which decodes via h264parse +
+    // avdec_h264/openh264dec on the slicer side -- no in-process
+    // libavcodec is required (Bambu Studio's bundled libavcodec is
+    // decoder-only, and Orca Slicer doesn't ship one at all).
+    std::unique_ptr<obn::rtsp::Passthrough> rtsp_pass;
 
     // Subtype of the video carried by this tunnel, filled in by
-    // Bambu_GetStreamInfo. MJPG for local-scheme tunnels (and for
-    // RTSPS too because the backend transcodes H.264 -> MJPEG so
-    // gstbambusrc keeps using its lightweight jpegdec path).
+    // Bambu_GetStreamInfo. MJPG for local-scheme tunnels (port 6000,
+    // A1/P1/A1 mini), AVC1 for RTSP(S) tunnels (X1/P1S/P2S/N7).
     int              sub_type = MJPG;
 
     // Bookkeeping for GetStreamInfo. We don't know the real frame rate
@@ -554,14 +563,12 @@ void tunnel_close(Tunnel* t)
         }
     }
 
-    if (t->video_pipe) {
-        // The backend's stop() releases its own resources (rtspsrc
-        // child elements for the gst backend, demuxer/decoder context
-        // for the ffmpeg backend). Reset the unique_ptr after stop()
-        // so a misbehaving backend can't reach a half-destroyed
-        // tunnel.
-        t->video_pipe->stop();
-        t->video_pipe.reset();
+    if (t->rtsp_pass) {
+        // stop() joins the worker thread and tears the RTSP client
+        // down. Reset the unique_ptr afterwards so a half-destroyed
+        // passthrough cannot be reached again on a Bambu_Open retry.
+        t->rtsp_pass->stop();
+        t->rtsp_pass.reset();
     }
 }
 
@@ -663,82 +670,74 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
 }
 
 // -----------------------------------------------------------------------
-// RTSP(S) video. The actual pipeline build / decode / transcode lives
-// in stubs/video_pipeline_<backend>.cpp -- this file only knows how to
-// translate StartConfig / Frame to/from the C-ABI shape Bambu_Sample
-// expects. Backends are selected at compile time via OBN_VIDEO_BACKEND
-// (see CMakeLists.txt); make_video_pipeline() is the single seam.
+// RTSP(S) video. We do not transcode: the printer sends H.264 over
+// RTP and gstbambusrc.c (vendored verbatim by both Bambu Studio and
+// Orca Slicer on Linux) feeds whatever Bambu_ReadSample returns into
+// `h264parse ! avdec_h264 / openh264dec / vaapih264dec`. So this side
+// only has to do RTSP/RTSPS handshake + RTP depacketisation + Annex-B
+// framing. All of that lives in stubs/rtsp_client.cpp and
+// stubs/rtsp_passthrough.cpp; here we just glue them onto the C ABI.
 // -----------------------------------------------------------------------
 
 [[maybe_unused]] int open_rtsp(Tunnel* t)
 {
-    auto pipeline = obn::video::make_video_pipeline(t->logger, t->log_ctx);
-    if (!pipeline) {
-        log_fmt(t->logger, t->log_ctx,
-                "open_rtsp: no video backend compiled in (build with "
-                "-DOBN_VIDEO_BACKEND=ffmpeg or =gstreamer)");
-        set_last_error("no video backend");
+    auto pass = std::make_unique<obn::rtsp::Passthrough>(t->logger, t->log_ctx);
+
+    log_fmt(t->logger, t->log_ctx,
+            "open_rtsp: dialing %s://%s:%d (user=%s)",
+            t->url.scheme == Scheme::Rtsps ? "rtsps" : "rtsp",
+            t->url.host.c_str(), t->url.port, t->url.user.c_str());
+
+    if (pass->start(t->url.host, t->url.port, t->url.user, t->url.passwd,
+                    t->url.path, t->url.scheme == Scheme::Rtsps) != 0) {
         return -1;
     }
 
-    obn::video::StartConfig cfg;
-    cfg.scheme = (t->url.scheme == Scheme::Rtsps)
-                     ? obn::video::Scheme::Rtsps
-                     : obn::video::Scheme::Rtsp;
-    cfg.host    = t->url.host;
-    cfg.port    = t->url.port;
-    cfg.user    = t->url.user;
-    cfg.passwd  = t->url.passwd;
-    cfg.path    = t->url.path;
-    cfg.target_width  = 1280;
-    cfg.target_height = 720;
-    cfg.target_fps    = 30;
-    log_fmt(t->logger, t->log_ctx,
-            "open_rtsp: backend=%s host=%s:%d user=%s",
-            obn::video::backend_name(),
-            cfg.host.c_str(), cfg.port, cfg.user.c_str());
-
-    if (pipeline->start(cfg) != 0) return -1;
-
-    t->video_pipe = std::move(pipeline);
-    // The transcoder always emits MJPEG so Studio's consumer side
-    // treats this tunnel like an A1/P1 camera. width/height/frame_rate
-    // are advisory until the first frame updates them.
-    t->sub_type   = MJPG;
-    t->width      = cfg.target_width;
-    t->height     = cfg.target_height;
-    t->frame_rate = cfg.target_fps;
+    t->rtsp_pass = std::move(pass);
+    // gstbambusrc looks at sub_type via Bambu_GetStreamInfo; AVC1 +
+    // video_avc_byte_stream is the format gstbambusrc's downstream
+    // pipeline already speaks (h264parse copes with any framing
+    // h264parse can detect, and Annex-B is the simplest one).
+    t->sub_type   = AVC1;
+    // Width/height/frame_rate are advisory until h264parse pulls them
+    // out of SPS; surface the firmware's well-known 1280x720@30 default
+    // so Studio's UI shows reasonable numbers from the start.
+    t->width      = 1280;
+    t->height     = 720;
+    t->frame_rate = 30;
     t->t0         = std::chrono::steady_clock::now();
     t->started    = true;
     log_fmt(t->logger, t->log_ctx,
-            "open_rtsp: pipeline ready (mjpg %dx%d)", t->width, t->height);
+            "open_rtsp: passthrough ready (avc1 %dx%d, gstbambusrc decodes)",
+            t->width, t->height);
     return Bambu_success;
 }
 
 int read_rtsp(Tunnel* t, Bambu_Sample* sample)
 {
-    if (!t->video_pipe) return -1;
-    obn::video::Frame f;
-    auto rc = t->video_pipe->try_pull(&f);
+    if (!t->rtsp_pass) return -1;
+    const std::uint8_t* buf      = nullptr;
+    std::size_t         size     = 0;
+    std::uint64_t       dt_100ns = 0;
+    int                 flags    = 0;
+    auto rc = t->rtsp_pass->try_pull(&buf, &size, &dt_100ns, &flags);
     switch (rc) {
-        case obn::video::Pull_Ok:
+        case obn::rtsp::Passthrough::Pull_Ok:
             break;
-        case obn::video::Pull_WouldBlock:
+        case obn::rtsp::Passthrough::Pull_WouldBlock:
             return Bambu_would_block;
-        case obn::video::Pull_StreamEnd:
+        case obn::rtsp::Passthrough::Pull_StreamEnd:
             return Bambu_stream_end;
-        case obn::video::Pull_Error:
+        case obn::rtsp::Passthrough::Pull_Error:
         default:
             return -1;
     }
 
-    if (f.width  > 0) t->width  = f.width;
-    if (f.height > 0) t->height = f.height;
     sample->itrack      = 0;
-    sample->size        = static_cast<int>(f.size);
-    sample->flags       = f.flags;
-    sample->buffer      = f.jpeg;
-    sample->decode_time = static_cast<unsigned long long>(f.dt_100ns);
+    sample->size        = static_cast<int>(size);
+    sample->flags       = flags;
+    sample->buffer      = buf;
+    sample->decode_time = static_cast<unsigned long long>(dt_100ns);
     return Bambu_success;
 }
 
@@ -2068,23 +2067,12 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     if (!t) return -1;
 
     // RTSP(S) is so different from MJPG that it gets its own code path
-    // (pipeline build + gst bus wait); MJPG stays as manual TLS + auth
-    // packet below.
+    // (passthrough worker + RTSP handshake); MJPG stays as manual
+    // TLS + auth packet below. Both the stock plugin and our passthrough
+    // hand raw H.264 byte-stream back to gstbambusrc, so this path is
+    // gated only on the URL scheme - not on OBN_ENABLE_WORKAROUNDS.
     if (t->url.scheme == Scheme::Rtsps || t->url.scheme == Scheme::Rtsp) {
-#if OBN_ENABLE_WORKAROUNDS
         return open_rtsp(t);
-#else
-        // RTSPS transcoding is a workaround: the stock BambuSource
-        // hands raw H.264 back to Studio's gstbambusrc, we turn it
-        // into MJPEG first. With the workaround disabled we bail
-        // cleanly so the user notices instead of getting an opaque
-        // "camera not connected" spinner.
-        set_last_error("RTSPS liveview disabled (OBN_ENABLE_WORKAROUNDS=OFF)");
-        log_fmt(t->logger, t->log_ctx,
-                "Bambu_Open: RTSPS(%s) refused: workarounds disabled",
-                t->url.host.c_str());
-        return -1;
-#endif
     }
 
     log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing %s:%d",
@@ -2148,12 +2136,12 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
 {
     // Both protocols start streaming implicitly:
     //   * MJPG: printer begins pushing frames right after auth.
-    //   * RTSP: Bambu_Open already started the IVideoPipeline.
+    //   * RTSP: Bambu_Open already started the passthrough worker.
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->video_pipe) return -1;
+         t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return -1;
     return Bambu_success;
 }
 
@@ -2188,8 +2176,8 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     if (!t) return 0;
     if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->video_pipe) return 0;
-    return 1; // one video track, MJPEG (transcoded for RTSP).
+         t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return 0;
+    return 1; // one video track (MJPEG for local-scheme, AVC1 for RTSP).
 }
 
 OBN_EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index,

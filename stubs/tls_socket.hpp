@@ -1,12 +1,12 @@
 // Shared TLS+TCP primitives for libBambuSource.
 //
-// Two camera protocols and one file-browser bridge in this plugin all
-// need the same dance: TCP-connect with a timeout, hand the fd to
-// OpenSSL, complete a TLS handshake against a Bambu self-signed cert,
-// and then send/receive bytes. Repeating that across mjpg_reader.cpp,
-// rtsp_client.cpp, and the FTPS path in BambuSource.cpp is how we ended
-// up with three slightly different timeout policies and SNI bugs in
-// the past, hence this consolidation.
+// The MJPG camera reader (port 6000), RTSP client (port 322), and FTPS
+// file-browser bridge in this plugin all need the same dance:
+// TCP-connect with a timeout, hand the fd to OpenSSL, complete a TLS
+// handshake against a Bambu self-signed cert, and then send/receive
+// bytes. Repeating that across BambuSource.cpp and rtsp_client.cpp is
+// how we ended up with slightly different timeout policies and SNI
+// bugs in the past, hence this consolidation.
 //
 // Design:
 //   * One process-wide SSL_CTX, configured TLS 1.0+ with SSL_VERIFY_NONE
@@ -25,8 +25,8 @@
 // Everything here is plain blocking I/O. Callers that need to break a
 // blocked SSL_read from another thread do it the standard way:
 // shutdown(fd, SHUT_RDWR) on the underlying socket, which causes
-// SSL_read to return error promptly. mjpg_reader and the upcoming
-// rtsp_client both rely on that for their stop() path.
+// SSL_read to return error promptly. rtsp_client relies on that for
+// its stop() path.
 #pragma once
 
 #include <cstddef>

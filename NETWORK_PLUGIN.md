@@ -737,9 +737,9 @@ The print-job submission ends with a single MQTT command published to the printe
 | `nozzle_mapping` | int array | `nozzle_mapping` (Studio passes a JSON-array string of ints, e.g. `"[0,1]"`) | Index = filament slot in the 3mf, value = physical nozzle/extruder position id. **Emitted only on multi-extruder printers** — Studio gates every assignment to `task_nozzle_mapping` on `MachineObject::GetNozzleRack()->IsSupported()` (see `SelectMachine.cpp:3107` and `CalibUtils.cpp:2225`/`2358`), so on single-nozzle hardware (P2S, X1C, A1, etc.) the field is omitted entirely from `project_file`. The Studio-side value is sourced verbatim from the printer's reply to the `get_auto_nozzle_mapping` MQTT query (`DevMappingNozzle.cpp:277-282` deserialises the `mapping` field into `std::vector<int>`), so the type is **always** a flat `int` array — no objects, no string-wrapped numbers, no `[0,-1,…]` sentinels analogous to `ams_mapping`. Stock-plugin observation: when Studio hands it a string with whitespace (e.g. `"[0,1, 2]"`), the stock plugin re-emits it as canonical `"[0,1,2]"`; this normalization is cosmetic and not required for firmware acceptance. |
 | `auto_bed_leveling` | int | `auto_bed_leveling` | Bed-leveling option as an int (0 = off, 1 = on, 2 = auto). Coexists with the boolean `bed_leveling`: the boolean is the user toggle, the int is the resolved policy after taking firmware capabilities into account. |
 | `nozzle_offset_cali` | int | `auto_offset_cali` (**name mismatch is intentional in upstream**) | Nozzle-offset calibration option (0 = off, 2 = auto). |
-| `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it's omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01` via `tools/plugin_runner` overlays (variants `extruder_cali_0`, `extruder_cali_1`). |
-| `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. The cross-ABI `tools/plugin_runner` matrix confirmed this: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"` regardless of overlays; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — if a future capture shows e.g. `"1"`, `"2"` or `"5"`, we'll learn another flag's meaning. |
-| `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**, not hardcoded as we previously assumed: setting `auto_flow_cali=1` via `tools/plugin_runner` overlay flipped `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. (We earlier saw only `0` because every captured Studio session shipped `auto_flow_cali=0`.) Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+| `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it is omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01`. |
+| `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. Cross-ABI confirmation: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"`; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — a future capture showing e.g. `"1"`, `"2"` or `"5"` would identify another flag's meaning. |
+| `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**: setting `auto_flow_cali=1` flips `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
 
 Sibling `header` object the stock plugin wraps the command in (cloud and LAN alike when paired against signature-checking firmware):
 
@@ -762,7 +762,7 @@ Other `PrintParams` members Studio populates but **does not put into the MQTT co
 
 ##### Cross-ABI `project_file` reverse-engineering matrix
 
-The mapping above was verified by driving `tools/plugin_runner` against an N7 in Developer Mode with stock `libbambu_networking.so` for each of these versions:
+The mapping above was verified by loading the stock `libbambu_networking.so` of each version below into a `BBL::PrintParams`-driven harness and capturing the resulting LAN MQTT `project_file` payload against an N7 in Developer Mode:
 
 | ABI tag | Plugin file | `cfg` baseline behaviour | New schema field(s) vs the prior tag |
 |---|---|---|---|
@@ -773,11 +773,11 @@ The mapping above was verified by driving `tools/plugin_runner` against an N7 in
 | `02.06.00` | `02.06.00.50` | same as `02.05.03` | none in `project_file`; only new exports are filament-spool CRUD (`bambu_network_get_filament_spools`, `bambu_network_create_filament_spool`, `bambu_network_update_filament_spool`, `bambu_network_delete_filament_spools`, `bambu_network_get_filament_config`) — those are HTTP plumbing, not LAN MQTT |
 | `02.06.01` | `02.06.01.50` | same as `02.05.03` | none |
 
-**Bottom line:** the on-the-wire `project_file` schema is essentially frozen across `02.05.x` -> `02.06.x`. The only ABI-significant change for LAN print submission is the addition of `task_timelapse_use_internal` in `02.05.03`, which feeds the `cfg` bitmask (and only bit `0x4` has been observed so far). All field mappings below were also confirmed identical between `02.05.00` and `02.06.01` for every overlay we tried (see the per-overlay table below) — only the `cfg` value differs between the two ABI families.
+**Bottom line:** the on-the-wire `project_file` schema is essentially frozen across `02.05.x` -> `02.06.x`. The only ABI-significant change for LAN print submission is the addition of `task_timelapse_use_internal` in `02.05.03`, which feeds the `cfg` bitmask (and only bit `0x4` has been observed so far). All field mappings below were also confirmed identical between `02.05.00` and `02.06.01` — only the `cfg` value differs between the two ABI families.
 
 ##### Per-`PrintParams`-field mapping (overlay matrix on ABI `02.05.03`)
 
-These were collected by toggling one `PrintParams` field at a time via the override hook (`tools/plugin_runner --params-json …`) and diffing the resulting `project_file` against the all-defaults baseline. They confirm — and in some cases correct — the per-row notes in the table above.
+The following matrix was collected by toggling one `PrintParams` field at a time before handing the struct to the stock plugin and diffing the resulting `project_file` against an all-defaults baseline. It confirms — and in some cases corrects — the per-row notes in the table above.
 
 | `PrintParams` field overridden | Resulting `project_file` change |
 |---|---|
@@ -792,7 +792,7 @@ These were collected by toggling one `PrintParams` field at a time via the overr
 | `auto_offset_cali=2` | `nozzle_offset_cali: 0 → 2` (note the upstream rename) |
 | `auto_bed_leveling=2` | `auto_bed_leveling: 0 → 2` (coexists with the `bed_leveling` boolean) |
 | `auto_flow_cali=1` | `extrude_cali_flag: 0 → 1` (this is how the previously mysterious `extrude_cali_flag` is populated) |
-| `project_name="obn-rename-test"` | `subtask_name`, `file`, and `url` all switch in lock-step (`<project_name>`, `<project_name>.gcode.3mf`, `ftp://<project_name>.gcode.3mf`) — the FTP upload path follows suit |
+| `project_name="my-print"` | `subtask_name`, `file`, and `url` all switch in lock-step (`<project_name>`, `<project_name>.gcode.3mf`, `ftp://<project_name>.gcode.3mf`) — the FTP upload path follows suit |
 | `plate_index=2` | `param: "Metadata/plate_1.gcode" → "Metadata/plate_2.gcode"` |
 
 Fields that did **not** appear on this hardware (P2S/N7 single-extruder) regardless of overrides: `nozzle_mapping` (gated on multi-extruder, see the dedicated row above), `url_enc` (Developer Mode bypasses the encrypted-URL requirement), and the entire `header` envelope (Developer Mode disables signature verification — see §6.8.2 above).
@@ -1510,7 +1510,7 @@ So on Linux the camera flow is:
 1. `MediaPlayCtrl::Play` → `m_media_ctrl->Load(wxURI("bambu:///..."))`.
 2. wxGStreamerMediaBackend builds the standard playbin with `bambusrc` as the source element.
 3. `bambusrc` calls `BAMBULIB(Bambu_Create)(..., url)` etc., i.e. our C ABI from `libBambuSource.so`.
-4. For MJPG streams the source emits JPEG access units; the playbin attaches `jpegdec ! videoconvert ! ximagesink`. For RTSPS streams Studio's plugin still asks our `libBambuSource.so` to output H.264 (or MJPEG, see §7.4.4).
+4. For MJPG streams the source emits JPEG access units; the playbin attaches `jpegdec ! videoconvert ! ximagesink`. For RTSPS streams the source emits raw H.264 byte stream and the playbin attaches `h264parse ! avdec_h264 / openh264dec ! videoconvert ! ximagesink`. Either way the slicer-side pipeline does the decode.
 
 i.e. **on Linux our C ABI is enough**. No Linux-specific code needs to live inside `libBambuSource.so`.
 
@@ -1600,7 +1600,7 @@ Studio drives it from `wxMediaCtrl2::Load` / `Play` / `Stop` (`wxMediaCtrl2.mm:8
 
 Failure mode if the symbol is missing: `m_error = -2`, `m_player = nullptr`. Subsequent `Load` / `Play` calls log `create_player failed currently!` and return without ever transitioning out of `MEDIASTATE_LOADING`. The user sees an **infinite "Loading…" spinner** in the camera tab, *not* the "Player is malfunctioning" dialog — the latter is reserved for `m_failed_code == 2`, which only fires after a state transition that never happens here. (`MediaPlayCtrl.cpp:29-36, 415-428`.)
 
-This is the reason a stock-only `libBambuSource.dylib` build (i.e. our C-ABI port without an Objective-C `BambuPlayer` class) is enough for the Mac file browser but produces an indefinite loading state in the Mac camera tab. Our actual implementation lives at `stubs/BambuPlayer.mm` and is only compiled when CMake detects an Apple target; see the `STATUS.md` and `README.md` for build details.
+This is the reason a C-ABI-only `libBambuSource.dylib` build (no Objective-C `BambuPlayer` class) is enough for the Mac file browser but produces an indefinite loading state in the Mac camera tab. This project does not currently ship a `BambuPlayer` implementation — the `STATUS.md` and `README.md` only target Linux. Adding macOS camera support would mean reintroducing a `stubs/BambuPlayer.mm` that exports `OBJC_CLASS_$_BambuPlayer` from the dylib.
 
 #### 7.4.4. Recap
 
@@ -1846,7 +1846,6 @@ A few practical contracts that the Studio code path enforces but does not docume
 | CTRL response dispatch | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1567-1596` |
 | Camera UI panel and state machine | `3rd_party/OrcaSlicer/src/slic3r/GUI/MediaPlayCtrl.cpp` |
 | Our C-ABI implementation | `stubs/BambuSource.cpp` |
-| Our macOS Objective-C `BambuPlayer` | `stubs/BambuPlayer.mm` |
 
 ---
 

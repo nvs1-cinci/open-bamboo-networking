@@ -2,8 +2,8 @@
 //
 // libBambuSource is a single shared object that bundles several
 // independent submodules (the C-ABI tunnel layer in BambuSource.cpp,
-// the GStreamer/FFmpeg video backends, the macOS BambuPlayer wrapper).
-// They all need the same three things:
+// the RTSP client and Annex-B passthrough). They all need the same
+// three things:
 //
 //   * a level-aware printf-style sink that fans out to (a) Studio's
 //     Logger callback when one is set on the tunnel and (b) a file

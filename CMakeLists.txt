@@ -116,8 +116,6 @@ option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
 #   - push_status `home_flag` SDCARD-bits rewrite (P2S reports NO_SDCARD)
 #   - push_status `ipcam.file` block injection (unblocks MediaFilePanel on P2S)
 #   - `start_sdcard_print` routed over LAN MQTT instead of the cloud API
-#   - RTSPS camera transcode to MJPEG inside libBambuSource
-#     (stock pipes H.264 straight to Studio's gstbambusrc)
 #   - PrinterFileSystem CTRL bridge served from a worker thread over FTPS
 #     (stock speaks a proprietary port-6000 CTRL protocol)
 # See "What works" and "Workaround reference" in README.md.
@@ -310,61 +308,50 @@ set_target_properties(bambu_networking PROPERTIES
 # wxMediaCtrl2.mm on macOS).
 # --------------------------------------------------------------------------
 
-# Picks the RTSPS backend used to demux H.264 + transcode to MJPEG:
-#   ffmpeg - in-process RTSP/RTSPS client (custom, stubs/rtsp_client.cpp)
-#            + libavcodec H.264 decode + libswscale + stb_image_write
-#            baseline JPEG encode. NO libavformat dependency, and no
-#            libavcodec encoder dependency (Studio's bundled libavcodec
-#            ships decoder-only, so avcodec_find_encoder returns NULL
-#            in-process). libav* symbols are resolved via
-#            dlsym(RTLD_DEFAULT, ...) against whatever Studio's bundle
-#            has already loaded -- guaranteed ABI match against the
-#            AppImage's bundled libav minor. Default; smallest runtime
-#            footprint; works on macOS too.
-#   none   - no RTSPS support; only the MJPG path (port 6000) and the
-#            file-browser CTRL bridge work. Useful for small builds
-#            that don't ship live view.
+# RTSPS livestream (X1/P1S/P2S/N7) is handled by a custom RTSP/RTSPS
+# client (stubs/rtsp_client.cpp) plus an Annex-B passthrough worker
+# (stubs/rtsp_passthrough.cpp). We do NOT decode or transcode H.264
+# in-process: gstbambusrc.c (vendored verbatim by both Bambu Studio
+# and Orca Slicer on Linux) hands whatever Bambu_ReadSample returns
+# straight at h264parse + avdec_h264 / openh264dec, so the slicer
+# already pulls H.264 decoders into the process. Doing it again here
+# would only add an in-process libavcodec dependency that neither
+# Studio (decoder-only bundle) nor Orca (no bundle at all) can
+# satisfy.
 #
-# A GStreamer backend used to live here (rtspsrc -> jpegenc pipeline)
-# but was removed once the FFmpeg one stabilised: it always aborted
-# inside Studio's AppImage with a libjpeg ABI clash we could not fix
-# from outside Studio's bundle, and the FFmpeg path turned out to work
-# everywhere we tried it.
-set(OBN_VIDEO_BACKEND "ffmpeg" CACHE STRING
-    "RTSPS video backend for libBambuSource (ffmpeg | none)")
-set_property(CACHE OBN_VIDEO_BACKEND PROPERTY STRINGS ffmpeg none)
-if(NOT OBN_VIDEO_BACKEND MATCHES "^(ffmpeg|none)$")
-    message(FATAL_ERROR
-        "OBN_VIDEO_BACKEND must be 'ffmpeg' or 'none' "
-        "(got '${OBN_VIDEO_BACKEND}').")
-endif()
-message(STATUS "obn: video backend = ${OBN_VIDEO_BACKEND}")
+# Historic context: we used to have OBN_VIDEO_BACKEND=ffmpeg|gstreamer
+# selecting an in-process H.264 -> MJPEG transcoder. Both were dropped
+# once we realised gstbambusrc was already doing the decode for us:
+# the ffmpeg path failed inside Orca because libavcodec wasn't loaded;
+# the gstreamer path always aborted with a libjpeg ABI clash inside
+# Studio's AppImage.
 
 # zlib is pulled in for the Metadata/plate_*.png unpacker used by
 # PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
 find_package(ZLIB REQUIRED)
 
-# Image decode/encode for the thumbnail letterbox path AND for the
-# RTSPS pipeline's JPEG re-encode are both handled by the vendored
-# stb_image / stb_image_write headers under stubs/third_party/. We
-# deliberately do *not* link libpng / libjpeg into BambuSource: see
-# stubs/image_io.hpp for why (libjpeg-turbo ABI tag mismatch with
-# Studio's bundled GStreamer plugins inside the same process; even
-# though we no longer use GStreamer ourselves, Studio still loads
-# its own copy and aborts if its libjpeg sees ours), and the comment
-# block in stubs/BambuSource.cpp around
+# Image decode/encode for the thumbnail letterbox path is handled by
+# the vendored stb_image / stb_image_write headers under
+# stubs/third_party/. We deliberately do *not* link libpng / libjpeg
+# into BambuSource: see stubs/image_io.hpp for why (libjpeg-turbo ABI
+# tag mismatch with Studio's bundled GStreamer plugins inside the same
+# process), and the comment block in stubs/BambuSource.cpp around
 # `using DecodedRGBA = obn::image::DecodedRGBA;`.
 
 # BambuSource ships the PrinterFileSystem CTRL bridge (FTPS-backed file
-# browser for X1/P1S/P2S/A-series in LAN mode), so it needs ftps + json +
-# log from the core tree. Compile them in directly instead of linking
-# against libbambu_networking to keep the shared-object self-contained
-# (Studio dlopens BambuSource *before* it loads the network plugin).
+# browser for X1/P1S/P2S/A-series in LAN mode) AND the RTSP/RTSPS
+# Annex-B H.264 passthrough used by the live view, so it needs ftps +
+# json + log from the core tree. Compile them in directly instead of
+# linking against libbambu_networking to keep the shared-object
+# self-contained (Studio dlopens BambuSource *before* it loads the
+# network plugin).
 set(_obn_bambusource_sources
     stubs/BambuSource.cpp
     stubs/image_io.cpp
     stubs/source_log.cpp
     stubs/tls_socket.cpp
+    stubs/rtsp_client.cpp
+    stubs/rtsp_passthrough.cpp
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
@@ -377,45 +364,6 @@ set(_obn_bambusource_sources
 # translation unit that includes the stb implementations.
 set_source_files_properties(stubs/image_io.cpp PROPERTIES
     COMPILE_FLAGS "-Wno-missing-field-initializers")
-if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    # The FFmpeg backend is now a custom RTSP/RTSPS client (rtsp_client)
-    # plus H.264 decode + libswscale + baseline JPEG encode (h264_decoder
-    # routes the decoded RGB through obn::image::encode_jpeg / stb).
-    # libavcodec / libavutil / libswscale are resolved through ffmpeg_dyn
-    # (dlsym against whatever Studio's bundle has loaded -- see
-    # stubs/ffmpeg_dyn.hpp). Two FFmpeg things we deliberately do *not*
-    # depend on:
-    #   * libavformat -- replaced by our own RTSP client. The ABI clash
-    #     that motivated all the dlmopen / namespace work was a
-    #     libavutil-vs-libavformat version mismatch we side-step by not
-    #     depending on libavformat anymore.
-    #   * the libavcodec MJPEG encoder -- Studio's libavcodec ships
-    #     decoder-only (avcodec_find_encoder returns NULL), so we use
-    #     stb_image_write instead. Its only dependency is image_io.cpp,
-    #     which is already in the source list above.
-    list(APPEND _obn_bambusource_sources
-        stubs/video_pipeline_libav.cpp
-        stubs/rtsp_client.cpp
-        stubs/h264_decoder.cpp
-        stubs/ffmpeg_dyn.cpp)
-else()
-    list(APPEND _obn_bambusource_sources stubs/video_pipeline_none.cpp)
-endif()
-
-# macOS specifically: Studio's wxMediaCtrl2.mm dlsym's an Objective-C
-# class `BambuPlayer` out of libBambuSource.dylib for the camera
-# widget. Without it the camera widget sits in MEDIASTATE_LOADING
-# forever (see stubs/BambuPlayer.mm for the full story). The
-# Objective-C class also pulls in a small MJPG reader (port-6000
-# protocol, see stubs/mjpg_reader.cpp) so the BambuPlayer doesn't
-# have to share the C-ABI tunnel state inside BambuSource.cpp.
-if(APPLE)
-    enable_language(OBJCXX)
-    list(APPEND _obn_bambusource_sources
-        stubs/BambuPlayer.mm
-        stubs/mjpg_reader.cpp
-    )
-endif()
 
 add_library(BambuSource SHARED ${_obn_bambusource_sources})
 target_include_directories(BambuSource PRIVATE include stubs)
@@ -428,55 +376,10 @@ target_link_libraries(BambuSource PRIVATE
     ZLIB::ZLIB
 )
 
-if(APPLE)
-    # ARC for the Objective-C class so we don't have to track retains
-    # by hand. The OrcaSlicer caller is non-ARC and explicitly invokes
-    # -dealloc; that interplay is documented in stubs/BambuPlayer.mm.
-    set_source_files_properties(stubs/BambuPlayer.mm PROPERTIES
-        COMPILE_FLAGS "-fobjc-arc")
-    # Cocoa view + AVSampleBufferDisplayLayer + CGImage / ImageIO are
-    # the bare-minimum frameworks for the rendering path.
-    target_link_libraries(BambuSource PRIVATE
-        "-framework Foundation"
-        "-framework QuartzCore"
-        "-framework AppKit"
-        "-framework AVFoundation"
-        "-framework CoreMedia"
-        "-framework CoreVideo"
-        "-framework CoreGraphics"
-        "-framework ImageIO")
-    # On macOS the dylib's filename Studio looks for is
-    # libBambuSource.dylib; CMake already picks .dylib on Apple but
-    # be explicit so a future BUILD_SHARED_LIBS=NO override doesn't
-    # accidentally produce a static archive.
-    set_target_properties(BambuSource PROPERTIES SUFFIX ".dylib")
-endif()
-
-if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    # libavcodec / libavutil / libswscale headers only -- enough for
-    # the AVFrame / AVCodecContext / AVPixelFormat types and for the
-    # AV_LOG_*, AV_PIX_FMT_*, FF_QP2LAMBDA, AV_INPUT_BUFFER_PADDING_SIZE
-    # macros our decoder + scaler + MJPEG encoder depend on. The actual
-    # libraries are NEVER linked: at runtime ffmpeg_dyn.cpp resolves
-    # the symbols via dlsym(RTLD_DEFAULT, ...), picking up whatever
-    # libav copies Bambu Studio's bundle has already DT_NEEDED'd into
-    # the process. That guarantees ABI compatibility with whatever
-    # libavutil/libavcodec minor pair Studio shipped, even when the
-    # build host's system libav is a different release. libavformat is
-    # not used anywhere in the plugin -- the RTSP / RTSPS protocol is
-    # implemented in stubs/rtsp_client.cpp -- so we deliberately do
-    # NOT pkg_check_modules it here; build hosts can be missing
-    # libavformat-dev entirely.
-    pkg_check_modules(AVCODEC   REQUIRED libavcodec)
-    pkg_check_modules(AVUTIL    REQUIRED libavutil)
-    pkg_check_modules(SWSCALE   REQUIRED libswscale)
-    target_include_directories(BambuSource PRIVATE
-        ${AVCODEC_INCLUDE_DIRS}
-        ${AVUTIL_INCLUDE_DIRS}
-        ${SWSCALE_INCLUDE_DIRS}
-    )
-    target_link_libraries(BambuSource PRIVATE ${CMAKE_DL_LIBS})
-endif()
+# RTSPS is handled by stubs/rtsp_client.cpp + stubs/rtsp_passthrough.cpp,
+# both of which only need OpenSSL (already linked above) and the C++
+# stdlib. There is no in-process libavcodec dependency: gstbambusrc on
+# the slicer side is the H.264 decoder.
 
 # --------------------------------------------------------------------------
 # liblive555.so  (stub; used by the real BambuSource internally)

@@ -129,9 +129,10 @@ bool encode_jpeg(const std::uint8_t* rgb,
     out->reserve(raw / 8);
 
     // stb_image_write's JPEG encoder takes tightly-packed data; the
-    // caller (h264_decoder.cpp) already routes sws_scale into a
-    // contiguous w*3-stride buffer for exactly this reason, so
-    // there is no per-row copy needed here.
+    // PNG -> letterbox -> JPEG path inside the file-system bridge
+    // already routes its scaler into a contiguous w*3-stride buffer
+    // for exactly this reason, so there is no per-row copy needed
+    // here.
     const int rc = stbi_write_jpg_to_func(
         &write_to_vector, out,
         static_cast<int>(w),

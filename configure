@@ -22,7 +22,6 @@ VENDOR_MOSQUITTO=OFF
 # usually hides libmosquitto from the plugin) but only when the user
 # did not opt out of it.
 VENDOR_MOSQUITTO_SET=0
-VIDEO_BACKEND=ffmpeg
 EXTRA_CMAKE_ARGS=""
 
 usage() {
@@ -110,13 +109,6 @@ Optional features:
                              cJSON development headers, and utlist.h
                              (usually from uthash-dev / uthash-devel).
   --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
-  --video-backend=BACKEND    RTSPS camera backend baked into
-                             libBambuSource: 'ffmpeg' (default; libav*)
-                             or 'none' (no RTSPS support, smaller
-                             build). MJPG-on-port 6000 keeps working
-                             under either option. See "Video backend"
-                             in README.md for the build dependencies
-                             the FFmpeg backend needs.
 
 Other:
   --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
@@ -150,7 +142,10 @@ for arg in "$@"; do
         --disable-static-mosquitto) STATIC_MOSQUITTO=OFF ;;
         --vendor-mosquitto)        VENDOR_MOSQUITTO=ON;  VENDOR_MOSQUITTO_SET=1 ;;
         --no-vendor-mosquitto)     VENDOR_MOSQUITTO=OFF; VENDOR_MOSQUITTO_SET=1 ;;
-        --video-backend=*)         VIDEO_BACKEND="${arg#*=}" ;;
+        --video-backend=*)
+            printf 'configure: --video-backend is deprecated and ignored '\
+'(libBambuSource now passes raw H.264 straight to gstbambusrc, '\
+'no transcoder backend is built into the plugin).\n' >&2 ;;
         --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
         -h|--help)                 usage; exit 0 ;;
         *)
@@ -166,20 +161,6 @@ if [ "$VENDOR_MOSQUITTO" = ON ] && [ "$STATIC_MOSQUITTO" = ON ]; then
         'configure: warning: --vendor-mosquitto and --enable-static-mosquitto are both set;' \
         '               the bundled mosquitto build is used (pkg-config static path ignored).' >&2
 fi
-
-# Catch typos here so the user gets a friendly message instead of a
-# 50-line CMake configure-time error stack. VIDEO_BACKEND has a real
-# default ("ffmpeg") rather than being empty so we can unconditionally
-# pass -DOBN_VIDEO_BACKEND below; see the comment near the cmake
-# invocation for why.
-case "$VIDEO_BACKEND" in
-    ffmpeg|none) ;;
-    *)
-        printf 'configure: --video-backend must be ffmpeg or none (got "%s")\n' \
-            "$VIDEO_BACKEND" >&2
-        exit 2
-        ;;
-esac
 
 case "$CLIENT_TYPE" in
     bambu_studio|orca_slicer) ;;
@@ -416,12 +397,7 @@ set -- "$@" \
     -DOBN_BUILD_TESTS="$TESTS" \
     -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF" \
     -DOBN_STATIC_MOSQUITTO="$STATIC_MOSQUITTO" \
-    -DOBN_VENDOR_MOSQUITTO="$VENDOR_MOSQUITTO" \
-    -DOBN_VIDEO_BACKEND="$VIDEO_BACKEND"
-# Always pass -DOBN_VIDEO_BACKEND so re-running configure without
-# --video-backend resets to the default (ffmpeg) instead of inheriting
-# whatever the previous run baked into CMakeCache.txt. Same reasoning
-# as for -DCMAKE_INSTALL_PREFIX above.
+    -DOBN_VENDOR_MOSQUITTO="$VENDOR_MOSQUITTO"
 # shellcheck disable=SC2086
 [ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
 
