@@ -1,0 +1,1038 @@
+// plugin_runner: Bambu Studio shim that loads any libbambu_networking.so
+// (matching the ABI_VERSION this binary was compiled against), drives the
+// minimal init sequence Studio uses, and then triggers one of the four
+// LAN print entry points with a user-supplied BBL::PrintParams. Real
+// MQTT publishes go straight to the printer; capture them in parallel
+// with tools/bambu_mqtt_spy.sh.
+//
+// CLI shape and field semantics are documented in tools/plugin_runner/README.md.
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <nlohmann/json.hpp>
+
+#include "obn/bambu_networking.hpp"
+
+#include "plugin_downloader.hpp"
+#include "plugin_loader.hpp"
+#include "print_params_io.hpp"
+
+namespace pr = obn::plugin_runner;
+using json = nlohmann::json;
+
+// ---------------------------------------------------------------------------
+// Logging — every event the plugin pushes to a callback is rendered as one
+// JSON line on stdout (and optionally mirrored to --log-out). Keeps the
+// post-run analysis trivially `jq`-able without obscuring the wire data.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::mutex g_log_mu;
+std::ofstream g_log_file;
+
+std::string iso8601_now()
+{
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto secs = system_clock::to_time_t(now);
+    auto us = duration_cast<microseconds>(now.time_since_epoch()).count() % 1'000'000;
+    std::tm tm{};
+    gmtime_r(&secs, &tm);
+    std::ostringstream os;
+    os << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S")
+       << '.' << std::setw(6) << std::setfill('0') << us << 'Z';
+    return os.str();
+}
+
+void emit_event(const std::string& kind, json payload)
+{
+    payload["_t"] = iso8601_now();
+    payload["_kind"] = kind;
+    std::string line = payload.dump();
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    std::cout << line << '\n';
+    std::cout.flush();
+    if (g_log_file) {
+        g_log_file << line << '\n';
+        g_log_file.flush();
+    }
+}
+
+void emit_text(const std::string& kind, const std::string& msg)
+{
+    json j;
+    j["msg"] = msg;
+    emit_event(kind, std::move(j));
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// CLI parsing — small hand-rolled parser to keep the binary dep-free.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct CliArgs {
+    std::string plugin_path;
+    std::string params_json;
+    std::string action = "send_gcode_to_sdcard";
+    std::string gcode_3mf;
+
+    // For --action send_raw: path to a JSON file whose contents are
+    // forwarded verbatim to send_message_to_printer (qos=1, flag=0,
+    // matching what Studio uses for printer commands). Use this to
+    // bypass the entire start_*_print flow and reverse the print
+    // command shape one field at a time, watching the printer's reply
+    // arrive over local_message.
+    std::string raw_json;
+    int         raw_qos      = 1;
+    int         raw_flag     = 0;
+    int         raw_settle_s = 5;
+    // Repeat the publish N times with this gap. Useful to probe whether
+    // the LAN MQTT session quietly drops between publishes (e.g. while
+    // an FTPS upload runs in parallel and the publish channel goes idle).
+    int         raw_repeat            = 1;
+    int         raw_repeat_interval_s = 5;
+
+    std::string dev_id;
+    std::string dev_ip;
+    std::string access_code;
+    std::string country = "US";
+    std::string log_out;
+    std::string cert_file;     // path to slicer_base64.cer; auto-resolved if empty
+    // Optional payload for change_user(). Empty string keeps the
+    // existing "no logged-in user" behaviour. Pass a JSON blob (or
+    // @path/to/file) to fake a cloud login session — useful when a
+    // plugin gates privileged MQTT publishes (project_file, etc.) on
+    // is_user_login() returning true.
+    std::string user_info;
+
+    // For wire-format reverse-engineering: after a print action
+    // finishes (Finished or ERROR latched), publish
+    //   {"print":{"command":"stop","param":"","sequence_id":"…"}}
+    // verbatim via send_message_to_printer. Only works on a printer
+    // that's in Developer Mode (otherwise the plugin's client-side
+    // filter drops the print:* publish with rc=-4). The printer flips
+    // gcode_state to FAILED within ~1s — the goal is to never let an
+    // experiment leave physical heat-up running.
+    bool        auto_stop = false;
+    bool        use_ssl_mqtt = true;
+    int         timeout_s = 90;
+    int         connect_settle_ms = 800;
+    bool        keep_tmpdir = false;
+    // If non-empty, use this as the plugin's config dir instead of
+    // mkdtemp'ing a fresh one. The killer use case: re-using a real
+    // BambuStudio config dir (typically ~/.config/BambuStudio) so the
+    // device cert at <config_dir>/certs/<dev_id>.pem (provisioned by
+    // the real Studio when it bound the printer) is already in place
+    // — install_device_cert / project_file signing both depend on it,
+    // and a fresh mkdtemp can't replicate it offline.
+    std::string data_dir;
+
+    // Stock plugins keep their MQTT / asio worker threads alive until
+    // their static destructors run at process exit; calling
+    // destroy_agent + disconnect_printer cleanly inside main can block
+    // up to ~60s waiting for those workers to drain. With --fast-exit
+    // we just flush logs and `_Exit` straight after the action
+    // completes. Default: true for --action none (diagnostics, you
+    // already saw what you cared about), false otherwise.
+    std::optional<bool> fast_exit;
+
+    // --download-only mode: skip the agent flow, just resolve a plugin
+    // for the given ABI prefix into the cache and print its absolute
+    // path on stdout. Used by the wrapper script before it picks the
+    // matching build dir.
+    bool        download_only = false;
+    std::string abi_prefix;        // MM.mm.pp
+    std::string cache_dir;         // override for ~/.cache/obn-plugin-runner
+    bool        force_download = false;
+};
+
+[[noreturn]] void usage(int rc)
+{
+    std::fputs(
+R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
+                     [--gcode-3mf PATH] --dev-id ID --dev-ip IP --access-code CODE
+                     [--country US] [--use-ssl-mqtt 0|1]
+                     [--cert-file PATH] [--timeout SECONDS]
+                     [--connect-settle-ms MS]
+                     [--log-out PATH] [--keep-tmpdir]
+
+       plugin_runner --action send_raw --raw-json FILE
+                     --plugin-path PATH --dev-id ID --dev-ip IP --access-code CODE
+                     [--raw-qos 1] [--raw-flag 0] [--raw-settle 5]
+
+       plugin_runner --download-only --abi MM.mm.pp [--cache-dir DIR] [--force]
+
+ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
+                | local_print_with_record | send_raw | none
+
+  none: skip the print dispatch entirely. Useful for diagnostics: just
+  init + connect_printer, then sit for --timeout seconds dumping every
+  callback event, then tear down cleanly.
+
+  send_raw: skip start_*_print and call send_message_to_printer directly
+  with the contents of --raw-json. The killer primitive for reverse-
+  engineering printer commands: hand-craft a payload, observe the reply
+  arrive over local_message during --raw-settle seconds, iterate.
+  --params-json is not required for this action.
+
+Driven from tools/plugin_runner.sh; see tools/plugin_runner/README.md.
+)", stderr);
+    std::exit(rc);
+}
+
+std::string require(const std::vector<std::string>& a, size_t i, const std::string& flag)
+{
+    if (i >= a.size()) {
+        std::fprintf(stderr, "plugin_runner: missing value for %s\n", flag.c_str());
+        usage(64);
+    }
+    return a[i];
+}
+
+CliArgs parse_cli(int argc, char** argv)
+{
+    CliArgs c;
+    std::vector<std::string> a(argv + 1, argv + argc);
+    for (size_t i = 0; i < a.size(); ++i) {
+        const std::string& f = a[i];
+        if      (f == "--plugin-path")       c.plugin_path = require(a, ++i, f);
+        else if (f == "--params-json")       c.params_json = require(a, ++i, f);
+        else if (f == "--action")            c.action      = require(a, ++i, f);
+        else if (f == "--gcode-3mf")         c.gcode_3mf   = require(a, ++i, f);
+        else if (f == "--raw-json")          c.raw_json    = require(a, ++i, f);
+        else if (f == "--raw-qos")           c.raw_qos     = std::stoi(require(a, ++i, f));
+        else if (f == "--raw-flag")          c.raw_flag    = std::stoi(require(a, ++i, f));
+        else if (f == "--raw-settle")        c.raw_settle_s = std::stoi(require(a, ++i, f));
+        else if (f == "--raw-repeat")        c.raw_repeat = std::stoi(require(a, ++i, f));
+        else if (f == "--raw-repeat-interval-s") c.raw_repeat_interval_s = std::stoi(require(a, ++i, f));
+        else if (f == "--dev-id")            c.dev_id      = require(a, ++i, f);
+        else if (f == "--dev-ip")            c.dev_ip      = require(a, ++i, f);
+        else if (f == "--access-code")       c.access_code = require(a, ++i, f);
+        else if (f == "--country")           c.country     = require(a, ++i, f);
+        else if (f == "--cert-file")         c.cert_file   = require(a, ++i, f);
+        else if (f == "--log-out")           c.log_out     = require(a, ++i, f);
+        else if (f == "--use-ssl-mqtt")      c.use_ssl_mqtt = std::stoi(require(a, ++i, f)) != 0;
+        else if (f == "--timeout")           c.timeout_s   = std::stoi(require(a, ++i, f));
+        else if (f == "--connect-settle-ms") c.connect_settle_ms = std::stoi(require(a, ++i, f));
+        else if (f == "--keep-tmpdir")       c.keep_tmpdir = true;
+        else if (f == "--data-dir")          c.data_dir = require(a, ++i, f);
+        else if (f == "--user-info")         c.user_info = require(a, ++i, f);
+        else if (f == "--auto-stop")         c.auto_stop = true;
+        else if (f == "--fast-exit")         c.fast_exit = true;
+        else if (f == "--no-fast-exit")      c.fast_exit = false;
+        else if (f == "--download-only")     c.download_only = true;
+        else if (f == "--abi")               c.abi_prefix    = require(a, ++i, f);
+        else if (f == "--cache-dir")         c.cache_dir     = require(a, ++i, f);
+        else if (f == "--force")             c.force_download = true;
+        else if (f == "-h" || f == "--help") usage(0);
+        else {
+            std::fprintf(stderr, "plugin_runner: unknown flag '%s'\n", f.c_str());
+            usage(64);
+        }
+    }
+    if (c.download_only) {
+        if (c.abi_prefix.empty()) {
+            std::fprintf(stderr, "plugin_runner: --download-only requires --abi MM.mm.pp\n");
+            usage(64);
+        }
+        return c;
+    }
+    // params_json is only mandatory for actions that consume PrintParams.
+    // send_raw / none can run without it.
+    bool needs_params = (c.action != "send_raw" && c.action != "none");
+    if (c.plugin_path.empty() ||
+        c.dev_id.empty()      || c.dev_ip.empty()      || c.access_code.empty()) {
+        std::fprintf(stderr, "plugin_runner: --plugin-path, --dev-id, --dev-ip "
+                             "and --access-code are all required\n");
+        usage(64);
+    }
+    if (needs_params && c.params_json.empty()) {
+        std::fprintf(stderr, "plugin_runner: --params-json is required for action '%s'\n",
+                     c.action.c_str());
+        usage(64);
+    }
+    if (c.action == "send_raw" && c.raw_json.empty()) {
+        std::fprintf(stderr, "plugin_runner: --action send_raw requires --raw-json PATH\n");
+        usage(64);
+    }
+    return c;
+}
+
+std::string default_cache_dir()
+{
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) return std::string(xdg) + "/obn-plugin-runner";
+    const char* home = std::getenv("HOME");
+    if (home && *home) return std::string(home) + "/.cache/obn-plugin-runner";
+    return "/tmp/obn-plugin-runner";
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Studio-mock environment: ephemeral data_dir with a 3-line BambuStudio.conf
+// and a best-effort cert handoff. The stock plugin reads BambuStudio.conf
+// during init for country_code/region; the rest of Studio's user state is
+// LAN-irrelevant and we deliberately don't fake it.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Tmpdir {
+    std::string path;
+    bool        keep = false;
+
+    ~Tmpdir() {
+        if (!keep && !path.empty()) {
+            std::string cmd = "rm -rf -- '" + path + "'";
+            int rc = std::system(cmd.c_str());
+            (void)rc;
+        }
+    }
+};
+
+Tmpdir make_tmpdir(bool keep)
+{
+    char tmpl[] = "/tmp/obn-plugin-runner-XXXXXX";
+    if (!mkdtemp(tmpl)) {
+        throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
+    }
+    Tmpdir t;
+    t.path = tmpl;
+    t.keep = keep;
+    return t;
+}
+
+void write_min_studio_conf(const std::string& dir, const std::string& country)
+{
+    std::ofstream o(dir + "/BambuStudio.conf");
+    if (!o) {
+        throw std::runtime_error("cannot open BambuStudio.conf for writing in " + dir);
+    }
+    // Minimal AppConfig the stock plugin reads at init. Mirrors the tiny
+    // subset of Slic3r::AppConfig that bambu_network_set_config_dir +
+    // change_user flow actually inspects. Anything missing falls back to
+    // documented defaults inside the plugin.
+    o << "{\n"
+      << "  \"app\": {\n"
+      << "    \"country_code\": \"" << country << "\",\n"
+      << "    \"language\":     \"en_US\",\n"
+      << "    \"region\":       \"" << country << "\"\n"
+      << "  }\n"
+      << "}\n";
+}
+
+struct CertResolution {
+    std::string folder;
+    std::string filename;
+};
+
+CertResolution resolve_cert(const std::string& cli_path)
+{
+    CertResolution r;
+    auto split = [&](const std::string& full) {
+        auto slash = full.rfind('/');
+        if (slash == std::string::npos) {
+            r.folder = ".";
+            r.filename = full;
+        } else {
+            r.folder   = full.substr(0, slash);
+            r.filename = full.substr(slash + 1);
+        }
+    };
+    if (!cli_path.empty()) {
+        split(cli_path);
+        return r;
+    }
+    // slicer_base64.cer is the trust anchor the stock plugin uses to verify
+    // the printer's self-signed TLS certificate during MQTT handshake. With
+    // an empty path the LAN MQTT connect deterministically fails with
+    // status=ConnectStatusFailed, msg="-1" — surfacing as a generic OpenSSL
+    // verify error inside the (encrypted) plugin log. Search a handful of
+    // well-known locations so the runner just works on a typical dev
+    // machine; users with non-standard layouts can still pass --cert-file.
+    const char* home = std::getenv("HOME");
+    std::vector<std::string> candidates;
+    if (home) {
+        candidates.emplace_back(std::string(home) + "/.config/BambuStudio/cert/slicer_base64.cer");
+        candidates.emplace_back(std::string(home) + "/BambuStudio/resources/cert/slicer_base64.cer");
+        candidates.emplace_back(std::string(home) + "/Bambu_Studio/resources/cert/slicer_base64.cer");
+    }
+    candidates.emplace_back("/usr/share/BambuStudio/resources/cert/slicer_base64.cer");
+    candidates.emplace_back("/opt/BambuStudio/resources/cert/slicer_base64.cer");
+    for (const auto& candidate : candidates) {
+        struct stat st{};
+        if (stat(candidate.c_str(), &st) == 0) {
+            split(candidate);
+            return r;
+        }
+    }
+    return r;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Completion latch — the print actions are async; update_fn flips the latch
+// when the plugin reports PrintingStageFinished (success) or
+// PrintingStageERROR (failure). main waits on this with a deadline.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Latch {
+    std::mutex                m;
+    std::condition_variable   cv;
+    bool                      done = false;
+    int                       last_status = -1;
+    int                       last_code = 0;
+    std::string               last_msg;
+
+    void mark(int status, int code, std::string msg) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            last_status = status;
+            last_code = code;
+            last_msg = std::move(msg);
+            done = true;
+        }
+        cv.notify_all();
+    }
+
+    bool wait_for(std::chrono::seconds dur) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, dur, [&]{ return done; });
+    }
+};
+
+// Tiny one-shot latch used to wait for the LAN MQTT session to come up
+// (set_on_local_connect_fn, status=ConnectStatusOk). connect_printer is
+// async — the plugin returns rc=0 immediately and the actual TLS
+// handshake takes ~5–6s. Publishing a message before this callback
+// fires deterministically returns -4 / -4030 inside the plugin (paho
+// reports MQTTASYNC_DISCONNECTED). Studio essentially polls
+// MachineObject::is_connecting() in its event loop; we just block.
+struct ReadyLatch {
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    ready = false;
+
+    void signal() {
+        { std::lock_guard<std::mutex> lk(m); ready = true; }
+        cv.notify_all();
+    }
+    bool wait_for(std::chrono::milliseconds dur) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, dur, [&]{ return ready; });
+    }
+};
+
+const char* stage_name(int s)
+{
+    using namespace BBL;
+    switch (s) {
+        case PrintingStageCreate:      return "Create";
+        case PrintingStageUpload:      return "Upload";
+        case PrintingStageWaiting:     return "Waiting";
+        case PrintingStageSending:     return "Sending";
+        case PrintingStageRecord:      return "Record";
+        case PrintingStageWaitPrinter: return "WaitPrinter";
+        case PrintingStageFinished:    return "Finished";
+        case PrintingStageERROR:       return "ERROR";
+        default:                       return "?";
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Init order is the verbatim copy of GUI_App.cpp:3596-3618:
+//   create_agent -> set_config_dir -> init_log -> set_cert_file
+//   -> install all callbacks -> set_country_code -> start()
+// Studio additionally calls change_user("") right after to mark the
+// session as logged out — some plugins refuse LAN print until this has
+// happened at least once.
+// ---------------------------------------------------------------------------
+
+int main(int argc, char** argv)
+try {
+    CliArgs args = parse_cli(argc, argv);
+
+    if (args.download_only) {
+        std::string cache = args.cache_dir.empty() ? default_cache_dir() : args.cache_dir;
+        auto r = pr::fetch_plugin(args.abi_prefix, cache, args.force_download);
+        if (!r.ok) {
+            std::fprintf(stderr, "plugin_runner: download failed: %s\n",
+                         r.error_message.c_str());
+            return 69; // EX_UNAVAILABLE
+        }
+        // stdout: machine-readable single-line JSON for the wrapper to parse.
+        json out;
+        out["ok"]      = true;
+        out["so_path"] = r.so_path;
+        out["version"] = r.version;
+        out["http"]    = r.http_status;
+        std::cout << out.dump() << '\n';
+        return 0;
+    }
+
+    if (!args.log_out.empty()) {
+        g_log_file.open(args.log_out, std::ios::trunc);
+        if (!g_log_file) {
+            std::fprintf(stderr, "plugin_runner: cannot open --log-out '%s'\n",
+                         args.log_out.c_str());
+            return 73;
+        }
+    }
+
+    emit_event("startup", {
+        {"plugin_path", args.plugin_path},
+        {"abi_version", static_cast<unsigned>(ABI_VERSION)},
+        {"action",      args.action},
+        {"dev_id",      args.dev_id},
+        {"dev_ip",      args.dev_ip},
+    });
+
+    // Step 1: dlopen + symbol resolution
+    pr::PluginExports exports = pr::load(args.plugin_path);
+    emit_event("plugin_loaded", {
+        {"version", exports.version},
+        {"so",      exports.so_path},
+    });
+
+    // Step 2: Studio data_dir. Either reuse a real one (--data-dir, e.g.
+    // ~/.config/BambuStudio so the device cert provisioned by Studio is
+    // available) or mkdtemp a fresh ephemeral one. We never overwrite
+    // BambuStudio.conf in a user-supplied dir.
+    Tmpdir tmpdir;
+    if (!args.data_dir.empty()) {
+        tmpdir.path = args.data_dir;
+        tmpdir.keep = true; // never wipe a user-supplied dir
+        struct stat st{};
+        if (stat(tmpdir.path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            emit_text("fatal", "--data-dir does not exist or is not a "
+                               "directory: " + tmpdir.path);
+            return 66;
+        }
+    } else {
+        tmpdir = make_tmpdir(args.keep_tmpdir);
+        write_min_studio_conf(tmpdir.path, args.country);
+    }
+    emit_event("data_dir", {
+        {"path",  tmpdir.path},
+        {"reuse", !args.data_dir.empty()},
+    });
+    CertResolution cert = resolve_cert(args.cert_file);
+    if (cert.filename.empty()) {
+        emit_text("warning",
+            "no slicer_base64.cer resolved — LAN MQTT handshake will fail "
+            "(local_connect status=1, msg=-1). Pass --cert-file PATH or copy "
+            "BambuStudio/resources/cert/slicer_base64.cer into "
+            "~/.config/BambuStudio/cert/.");
+    } else {
+        emit_event("cert_resolved", {
+            {"folder", cert.folder}, {"filename", cert.filename},
+        });
+    }
+
+    // Step 3: create the agent. log_dir == data_dir is what Studio passes in.
+    void* agent = exports.create_agent(tmpdir.path);
+    if (!agent) {
+        emit_text("fatal", "create_agent returned null");
+        return 70;
+    }
+    // RAII for the agent: any subsequent throw still tears down the
+    // plugin's worker threads. Without this the dlopen'd library's
+    // global destructors hit joinable std::thread members and abort
+    // with "terminate called without an active exception".
+    struct AgentGuard {
+        pr::PluginExports* ex;
+        void* a;
+        ~AgentGuard() {
+            if (ex && a) {
+                if (ex->disconnect_printer) ex->disconnect_printer(a);
+                if (ex->destroy_agent)      ex->destroy_agent(a);
+            }
+        }
+    };
+    AgentGuard guard{&exports, agent};
+
+    // Step 4: install callbacks (each one just dumps a JSON event).
+    Latch latch;
+    ReadyLatch session_ready;
+    std::atomic<bool> printer_connected{false};
+
+    exports.set_on_local_message_fn(agent,
+        [](std::string dev_id, std::string msg) {
+            emit_event("local_message", { {"dev_id", dev_id}, {"msg", msg} });
+        });
+    exports.set_on_message_fn(agent,
+        [](std::string dev_id, std::string msg) {
+            emit_event("message", { {"dev_id", dev_id}, {"msg", msg} });
+        });
+    exports.set_on_user_message_fn(agent,
+        [](std::string dev_id, std::string msg) {
+            emit_event("user_message", { {"dev_id", dev_id}, {"msg", msg} });
+        });
+    exports.set_on_local_connect_fn(agent,
+        [&printer_connected, &session_ready](int status, std::string dev_id, std::string msg) {
+            emit_event("local_connect", {
+                {"status", status}, {"dev_id", dev_id}, {"msg", msg},
+            });
+            using namespace BBL;
+            if (status == ConnectStatusOk) {
+                printer_connected.store(true);
+                session_ready.signal();
+            }
+        });
+    exports.set_on_printer_connected_fn(agent,
+        [&printer_connected, &session_ready](std::string topic) {
+            emit_event("printer_connected", { {"topic", topic} });
+            printer_connected.store(true);
+            session_ready.signal();
+        });
+    exports.set_on_server_connected_fn(agent,
+        [](int rc, int reason) {
+            emit_event("server_connected", { {"rc", rc}, {"reason", reason} });
+        });
+    exports.set_on_http_error_fn(agent,
+        [](unsigned int status, std::string body) {
+            emit_event("http_error", { {"status", status}, {"body", body} });
+        });
+    exports.set_on_subscribe_failure_fn(agent,
+        [](std::string topic) {
+            emit_event("subscribe_failure", { {"topic", topic} });
+        });
+    {
+        // get_country_code is polled by the plugin to refresh region
+        // routing; we just echo back the CLI value.
+        std::string country = args.country;
+        exports.set_get_country_code_fn(agent, [country]() { return country; });
+    }
+    if (exports.set_queue_on_main_fn) {
+        // Inline-execute every "post to main thread" the plugin requests.
+        // No UI loop here — running on whichever worker thread queued
+        // the call is safe for our LAN-print scope.
+        exports.set_queue_on_main_fn(agent, [](std::function<void()> fn) {
+            if (fn) fn();
+        });
+    }
+    exports.set_server_callback(agent,
+        [](std::string url, int status) {
+            emit_event("server_callback", { {"url", url}, {"status", status} });
+        });
+    exports.set_on_ssdp_msg_fn(agent,
+        [](std::string info_json) {
+            emit_event("ssdp_msg", { {"info", info_json} });
+        });
+
+    // Step 5: replicate Studio's init order (GUI_App.cpp:3596-3618).
+    // Order matters — set_extra_http_header lands BEFORE start() so the
+    // X-BBL-* headers are already in the plugin's HTTP client by the time
+    // it does its first connect / cert exchange against the printer.
+    exports.set_config_dir(agent, tmpdir.path);
+    exports.init_log(agent);
+    exports.set_cert_file(agent, cert.folder, cert.filename);
+    {
+        // Studio's init_http_extra_header() — these headers propagate to
+        // every outgoing HTTP request including the LAN /info ping.
+        // X-BBL-Client-Version uses Studio's full SLIC3R_VERSION; we
+        // pretend to be a current build so the API doesn't reject the
+        // request as legacy.
+        std::map<std::string, std::string> hdrs;
+        hdrs["X-BBL-Client-Type"]    = "slicer";
+        hdrs["X-BBL-Client-Name"]    = "BambuStudio";
+        hdrs["X-BBL-Client-Version"] = "02.05.03.99";
+        hdrs["X-BBL-OS-Type"]        = "linux";
+        hdrs["X-BBL-OS-Version"]     = "1.0.0";
+        hdrs["X-BBL-Language"]       = "en";
+        exports.set_extra_http_header(agent, hdrs);
+        emit_event("extra_http_header", { {"count", hdrs.size()} });
+    }
+    exports.set_country_code(agent, args.country);
+    int rc_start = exports.start(agent);
+    emit_event("agent_start", { {"rc", rc_start} });
+
+    // Step 5.5: post-start init Studio always runs (GUI_App.cpp:3586-3594
+    // for multi_machine, then start_discovery elsewhere). Both are
+    // best-effort — failures here are not fatal but missing wires can
+    // leave the plugin in a half-initialised state.
+    exports.enable_multi_machine(agent, false);
+    bool disc_ok = exports.start_discovery(agent, true, false);
+    emit_event("post_start_init", {
+        {"multi_machine", false}, {"start_discovery", disc_ok},
+    });
+
+    // Step 6: prime the plugin's user session. Empty string mirrors
+    // Studio's first-frame "no logged-in user" state. A non-empty
+    // --user-info value is forwarded verbatim — pass a minimal
+    // {"user_id":"default_user","token":"…"} to convince the plugin
+    // that a cloud session is active (some builds gate the privileged
+    // MQTT publishes on is_user_login()).
+    std::string user_blob = args.user_info;
+    if (!user_blob.empty() && user_blob.front() == '@') {
+        std::ifstream uf(user_blob.substr(1));
+        if (!uf) {
+            emit_text("fatal", "cannot open --user-info file: " + user_blob.substr(1));
+            return 66;
+        }
+        std::stringstream uss; uss << uf.rdbuf();
+        user_blob = uss.str();
+    }
+    int rc_user = exports.change_user(agent, user_blob);
+    bool logged = exports.is_user_login ? exports.is_user_login(agent) : false;
+    emit_event("change_user", {
+        {"rc",          rc_user},
+        {"bytes",       user_blob.size()},
+        {"is_logged_in", logged},
+    });
+
+    // Step 6.5: bind_detect — the LAN HTTP /info ping Studio runs before
+    // connect_printer (sLocalBindFunc in GUI_App.cpp:8242). The stock
+    // plugin needs detectResult cached so its MQTT layer knows whether
+    // it's talking to a LAN/cloud/farm device. Skipping it makes the
+    // subsequent local_connect callback fire with status=1, msg="-1"
+    // even though connect_printer itself returns 0.
+    {
+        BBL::detectResult detect{};
+        int rc_detect = exports.bind_detect(agent, args.dev_ip, "secure", detect);
+        emit_event("bind_detect", {
+            {"rc",           rc_detect},
+            {"dev_id",       detect.dev_id},
+            {"dev_name",     detect.dev_name},
+            {"model_id",     detect.model_id},
+            {"version",      detect.version},
+            {"bind_state",   detect.bind_state},
+            {"connect_type", detect.connect_type},
+            {"command",      detect.command},
+            {"result_msg",   detect.result_msg},
+        });
+    }
+
+    // Step 7: connect the printer over LAN MQTT. connect_printer is
+    // async — it returns rc=0 immediately and the actual TLS handshake +
+    // subscribe completes a few seconds later. We must wait for
+    // local_connect(ConnectStatusOk) before doing anything else.
+    int rc_conn = exports.connect_printer(agent, args.dev_id, args.dev_ip,
+                                          /*username=*/"bblp",
+                                          /*password=*/args.access_code,
+                                          /*use_ssl=*/args.use_ssl_mqtt);
+    emit_event("connect_printer_call", { {"rc", rc_conn} });
+
+    {
+        auto cap = std::chrono::milliseconds(std::max(args.connect_settle_ms, 1000));
+        bool got = session_ready.wait_for(cap);
+        emit_event("session_ready", { {"got", got}, {"cap_ms", cap.count()} });
+        if (!got) {
+            emit_text("warning",
+                "local_connect ConnectStatusOk did not fire within "
+                "--connect-settle-ms; LAN MQTT publish will likely fail. "
+                "Increase --connect-settle-ms or check cert / network.");
+        }
+    }
+
+    // Step 7.5: replicate Studio's post-connect bring-up. Studio calls
+    // start_subscribe("app") (cloud telemetry, harmless on LAN) and then
+    // polls command_request_push_all() in keep_alive() until the printer
+    // emits its first push_status (m_push_count > 0). The pushall is the
+    // *only* publish Studio guarantees in the first second — without it
+    // the printer never spontaneously sends a fresh full state, so we
+    // can't tell the session is healthy. Doing it ourselves here also
+    // serves as a smoke test of send_message_to_printer (any non-zero rc
+    // means the LAN publish channel is broken — fail fast).
+    {
+        int rc_sub = exports.start_subscribe(agent, "app");
+        emit_event("start_subscribe", { {"module", "app"}, {"rc", rc_sub} });
+    }
+    {
+        // Verbatim copy of Studio's MachineObject::command_request_push_all
+        // payload. sequence_id is a string in the original; we use a
+        // fixed value because uniqueness only matters for response
+        // matching, which we don't do.
+        const std::string pushall =
+            "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\","
+            "\"version\":1,\"push_target\":1}}";
+        int rc_push = exports.send_message_to_printer(
+            agent, args.dev_id, pushall, /*qos=*/1, /*flag=*/0);
+        emit_event("kickstart_pushall", {
+            {"rc",    rc_push},
+            {"bytes", pushall.size()},
+        });
+        if (rc_push != 0) {
+            emit_text("warning",
+                "kickstart pushall publish failed — LAN MQTT publish "
+                "channel is not actually ready, downstream actions will "
+                "likely also fail.");
+        }
+
+        // Mirrors MachineObject::command_get_version (publish_json
+        // {"info":{"sequence_id":"…","command":"get_version"}}, qos=1).
+        // The plugin doesn't gate anything on the response but Studio
+        // always sends it, so we replicate to keep the printer's
+        // observed sequence identical.
+        const std::string get_version =
+            "{\"info\":{\"sequence_id\":\"1\",\"command\":\"get_version\"}}";
+        int rc_ver = exports.send_message_to_printer(
+            agent, args.dev_id, get_version, /*qos=*/1, /*flag=*/0);
+        emit_event("kickstart_get_version", {
+            {"rc", rc_ver}, {"bytes", get_version.size()},
+        });
+
+        // Mirrors MachineObject::command_get_access_code
+        // (publish_json {"system":{"sequence_id":"…","command":"get_access_code"}}).
+        const std::string get_ac =
+            "{\"system\":{\"sequence_id\":\"2\",\"command\":\"get_access_code\"}}";
+        int rc_ac = exports.send_message_to_printer(
+            agent, args.dev_id, get_ac, /*qos=*/1, /*flag=*/0);
+        emit_event("kickstart_get_access_code", {
+            {"rc", rc_ac}, {"bytes", get_ac.size()},
+        });
+
+        // The keystone of Studio's post-connect bring-up: provision the
+        // per-printer device cert the plugin uses to RSA-sign privileged
+        // MQTT commands (project_file, etc.). Skipping this is the
+        // proximate cause of `start_local_print` returning -4030 ("send
+        // msg failed") on the Sending stage — every `print:*` payload
+        // the plugin tries to publish gets pre-flight-rejected with -4
+        // because there's no cert available to sign it with. lan_only=1
+        // matches what Studio passes when is_lan_mode_printer() is true
+        // (no cloud lookup).
+        if (exports.install_device_cert) {
+            exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
+            emit_event("install_device_cert", {
+                {"dev_id", args.dev_id}, {"lan_only", true},
+            });
+        } else {
+            emit_text("warning",
+                "plugin does not export bambu_network_install_device_cert; "
+                "privileged MQTT publishes (start_local_print, etc.) will "
+                "likely fail with -4030.");
+        }
+
+        // Settle so:
+        //   1) the printer's pushall reply lands in local_message
+        //   2) install_device_cert finishes any async work (HTTP fetch
+        //      from cloud, on-disk cert import, etc.) before we publish
+        //      a privileged command. Empirically the cert provisioning
+        //      path inside stock plugins can take ~3-5s on first call.
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+    }
+
+    // Step 8: load PrintParams from JSON, then back-fill the LAN-required
+    // fields from the CLI so the user doesn't have to encode the printer
+    // identity in every experiment.json. Skipped for actions that don't
+    // consume a PrintParams (send_raw, none).
+    BBL::PrintParams params{};
+    if (!args.params_json.empty()) {
+        std::vector<std::string> warns;
+        pr::load_print_params_from_json(args.params_json, params, warns);
+        for (auto& w : warns) emit_text("params_warning", w);
+    }
+    if (params.dev_id.empty())   params.dev_id   = args.dev_id;
+    if (params.dev_ip.empty())   params.dev_ip   = args.dev_ip;
+    if (params.username.empty()) params.username = "bblp";
+    if (params.password.empty()) params.password = args.access_code;
+    params.use_ssl_for_mqtt = args.use_ssl_mqtt;
+    if (!args.gcode_3mf.empty()) {
+        if (params.filename.empty()) params.filename = args.gcode_3mf;
+        // ftp_file is the destination basename on the printer's storage;
+        // default to the source basename if the user didn't override.
+        if (params.ftp_file.empty()) {
+            auto slash = args.gcode_3mf.rfind('/');
+            params.ftp_file = (slash == std::string::npos)
+                ? args.gcode_3mf : args.gcode_3mf.substr(slash + 1);
+        }
+    }
+
+    auto on_update = [&latch](int status, int code, std::string msg) {
+        emit_event("update_status", {
+            {"status", status}, {"stage", stage_name(status)},
+            {"code", code}, {"msg", msg},
+        });
+        using namespace BBL;
+        if (status == PrintingStageFinished || status == PrintingStageERROR)
+            latch.mark(status, code, std::move(msg));
+    };
+    auto on_cancel = []() { return false; };
+    auto on_wait   = [](int status, std::string job_info) {
+        emit_event("wait_status", { {"status", status}, {"info", job_info} });
+        return true;
+    };
+
+    // Step 9: dispatch the requested action.
+    int rc_action = -1;
+    if (args.action == "none") {
+        emit_text("info", "action=none — sleeping for --timeout seconds and "
+                          "logging callbacks; no print dispatch");
+        std::this_thread::sleep_for(std::chrono::seconds(args.timeout_s));
+        emit_event("idle_done", { {"seconds", args.timeout_s} });
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        guard.a = nullptr;
+        exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return 0;
+    } else if (args.action == "send_raw") {
+        // Read the JSON file verbatim and hand it to the plugin's
+        // direct-publish primitive. We deliberately don't validate or
+        // re-serialize: byte-for-byte control is the whole point of
+        // this mode.
+        std::ifstream rf(args.raw_json, std::ios::binary);
+        if (!rf) {
+            emit_text("fatal", "cannot open --raw-json file: " + args.raw_json);
+            return 66;
+        }
+        std::stringstream rss;
+        rss << rf.rdbuf();
+        std::string payload = rss.str();
+        emit_event("send_raw_call", {
+            {"path",        args.raw_json},
+            {"bytes",       payload.size()},
+            {"qos",         args.raw_qos},
+            {"flag",        args.raw_flag},
+            {"settle_s",    args.raw_settle_s},
+            {"repeat",      args.raw_repeat},
+            {"interval_s",  args.raw_repeat_interval_s},
+        });
+        for (int i = 0; i < std::max(args.raw_repeat, 1); ++i) {
+            int rc = exports.send_message_to_printer(
+                agent, args.dev_id, payload, args.raw_qos, args.raw_flag);
+            emit_event("send_raw_rc", { {"iter", i}, {"rc", rc} });
+            rc_action = rc;
+            if (i + 1 < args.raw_repeat) {
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(args.raw_repeat_interval_s));
+            }
+        }
+        // send_message_to_printer is fire-and-forget; loiter for a few
+        // seconds so the printer's reply (push_status / err) lands in
+        // local_message before we tear down.
+        std::this_thread::sleep_for(std::chrono::seconds(args.raw_settle_s));
+        // Synthesise a "finished" so the standard wait/teardown path
+        // below doesn't loiter for the full --timeout.
+        latch.mark(BBL::PrintingStageFinished, rc_action, "send_raw done");
+    } else if (args.action == "send_gcode_to_sdcard") {
+        if (!exports.start_send_gcode_to_sdcard) {
+            emit_text("fatal", "plugin does not export bambu_network_start_send_gcode_to_sdcard");
+            return 70;
+        }
+        rc_action = exports.start_send_gcode_to_sdcard(agent, params, on_update, on_cancel, on_wait);
+    } else if (args.action == "local_print") {
+        if (!exports.start_local_print) {
+            emit_text("fatal", "plugin does not export bambu_network_start_local_print");
+            return 70;
+        }
+        rc_action = exports.start_local_print(agent, params, on_update, on_cancel);
+    } else if (args.action == "sdcard_print") {
+        if (!exports.start_sdcard_print) {
+            emit_text("fatal", "plugin does not export bambu_network_start_sdcard_print");
+            return 70;
+        }
+        rc_action = exports.start_sdcard_print(agent, params, on_update, on_cancel);
+    } else if (args.action == "local_print_with_record") {
+        if (!exports.start_local_print_with_record) {
+            emit_text("fatal", "plugin does not export bambu_network_start_local_print_with_record");
+            return 70;
+        }
+        rc_action = exports.start_local_print_with_record(agent, params, on_update, on_cancel, on_wait);
+    } else {
+        emit_text("fatal", "unknown --action '" + args.action + "'");
+        return 64;
+    }
+    emit_event("action_dispatched", { {"action", args.action}, {"rc", rc_action} });
+
+    // Step 10: wait for completion or timeout.
+    bool finished = latch.wait_for(std::chrono::seconds(args.timeout_s));
+    if (!finished) {
+        emit_event("timeout", { {"seconds", args.timeout_s} });
+    } else {
+        emit_event("finished", {
+            {"status", latch.last_status},
+            {"stage",  stage_name(latch.last_status)},
+            {"code",   latch.last_code},
+            {"msg",    latch.last_msg},
+        });
+    }
+
+    // Step 10.5: optionally abort the print so the printer doesn't
+    // actually start heating / extruding after the experiment. Mirrors
+    // MachineObject::command_task_abort. Only works in Developer Mode
+    // (otherwise send_message_to_printer rejects print:* with rc=-4).
+    // Idempotent — sending stop to an already-FAILED job is a no-op
+    // on firmware side.
+    if (args.auto_stop &&
+        (args.action == "local_print" ||
+         args.action == "sdcard_print" ||
+         args.action == "local_print_with_record")) {
+        const std::string stop_payload =
+            "{\"print\":{\"command\":\"stop\",\"param\":\"\","
+            "\"sequence_id\":\"99999\"}}";
+        int rc_stop = exports.send_message_to_printer(
+            agent, args.dev_id, stop_payload, /*qos=*/1, /*flag=*/0);
+        emit_event("auto_stop", {
+            {"rc",    rc_stop},
+            {"bytes", stop_payload.size()},
+        });
+        if (rc_stop != 0) {
+            emit_text("warning",
+                "auto_stop publish failed — the printer will keep the "
+                "job running. Either the printer is not in Developer "
+                "Mode (the plugin's client-side filter drops print:* "
+                "publishes) or the LAN MQTT session is gone. Send the "
+                "stop manually from the printer UI.");
+        }
+        // Brief settle so the FAILED state is visible in the next
+        // local_message before we tear down.
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    }
+
+    // Step 11: tear down. Default: graceful for real actions (so
+    // destroy_agent can flush any final MQTT publishes / FTP retries).
+    // Opt out with --fast-exit if you only care about events already in
+    // --log-out and don't want to wait ~60s for the worker pool to drain.
+    int exit_code = (!finished) ? 75
+                                : (latch.last_status == BBL::PrintingStageFinished ? 0 : 1);
+    bool fast = args.fast_exit.value_or(false);
+    if (fast) {
+        emit_event("shutdown", { {"finished", finished}, {"fast_exit", true} });
+        std::cout.flush();
+        if (g_log_file) g_log_file.flush();
+        std::_Exit(exit_code);
+    }
+    guard.a = nullptr;
+    exports.disconnect_printer(agent);
+    exports.destroy_agent(agent);
+    pr::unload(exports);
+    emit_event("shutdown", { {"finished", finished}, {"fast_exit", false} });
+    return exit_code;
+}
+catch (const std::exception& e) {
+    std::fprintf(stderr, "plugin_runner: fatal: %s\n", e.what());
+    return 70;
+}
