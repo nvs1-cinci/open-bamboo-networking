@@ -10,9 +10,9 @@
 //     threads.
 //   * TLS is delegated to libcurl's TLS backend (OpenSSL on our build).
 //     api.bambulab.com sits behind Cloudflare which is picky about TLS
-//     fingerprints; we don't yet attempt to mimic a full browser JA3,
-//     but we do set a realistic User-Agent and the headers Studio's
-//     real plugin is known to use.
+//     fingerprints; we don't yet attempt to mimic a full browser JA3.
+//     Default User-Agent is `OBN/<plugin version>` unless overridden per
+//     request or merged from Studio via bambu_network_set_extra_http_header.
 //   * Responses are delivered as a plain struct with status + body +
 //     a subset of headers (`Set-Cookie`, `Content-Type`). Callers do
 //     the JSON parsing themselves (we keep a zero-dep JSON reader

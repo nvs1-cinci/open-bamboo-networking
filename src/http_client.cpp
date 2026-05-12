@@ -17,16 +17,14 @@ namespace {
 std::atomic<bool> g_inited{false};
 std::mutex        g_init_mu;
 
-// We pretend to be Studio as closely as we can: Cloudflare has been
-// observed to 403 generic libcurl UAs against bambulab.com. Studio's
-// real plugin sets a UA like "BBL-Slicer/v02.05.02.51". We keep that
-// format so the servers don't treat us as a scraper.
+// Identify HTTP traffic as this project. Callers (or Studio via
+// bambu_network_set_extra_http_header) may override with Request.headers.
 std::string default_user_agent()
 {
 #ifndef OBN_VERSION_STRING
 #    error "OBN_VERSION_STRING is not defined; build through the top-level ./configure or pass -DOBN_VERSION=... to cmake"
 #endif
-    return std::string("BBL-Slicer/v") + OBN_VERSION_STRING;
+    return std::string("OBN/") + OBN_VERSION_STRING;
 }
 
 size_t on_body(void* ptr, size_t size, size_t nmemb, void* userdata)
