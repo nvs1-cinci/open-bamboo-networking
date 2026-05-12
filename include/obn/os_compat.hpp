@@ -81,8 +81,10 @@ void close_socket(socket_t s);
 // Last error from a socket call. WSAGetLastError on Windows, errno on
 // POSIX. Translated so the caller can still compare against
 // EWOULDBLOCK / EINPROGRESS / EBADF / EINTR -- on Windows we map
-// WSAEWOULDBLOCK and WSAEINPROGRESS both to EINPROGRESS (the more
-// common check), WSAEINTR to EINTR, WSAEBADF to EBADF.
+// WSAEWOULDBLOCK to EWOULDBLOCK, WSAEINPROGRESS to EINPROGRESS,
+// WSAEINTR to EINTR, and WSAEBADF to EBADF. Callers that want the
+// non-blocking "would block / connect in progress" condition should
+// prefer socket_in_progress(err) rather than checking only one errno.
 int last_socket_error();
 
 // True if `err` (as returned by last_socket_error) is the "operation
