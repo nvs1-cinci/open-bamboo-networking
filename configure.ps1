@@ -11,6 +11,12 @@
 #   .\configure.ps1 -ClientType orca_slicer
 #   .\configure.ps1 -BuildType Debug -EnableTests:$false
 #   .\configure.ps1 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows
+#   .\configure.ps1 -Generator "Visual Studio 17 2022"   # pin a VS version
+#
+# If -Generator is omitted, it is not passed to CMake and CMake picks its
+# platform default (on Windows with VS installed, typically the newest
+# Visual Studio). VCPKG_ROOT does not imply a compiler/VS version; use
+# -Generator when you must match a specific toolset (e.g. VS 2019 / v142).
 #
 # Requirements:
 #   - Visual Studio 2019 (toolset v142) -- matches the MSVC ABI Bambu Studio
@@ -46,7 +52,9 @@ param(
     # the older default.
     [ValidateSet("x64-windows","x64-windows-static","x64-windows-static-md","x86-windows","x86-windows-static")]
     [string]   $VcpkgTriplet = "x64-windows-static-md",
-    [string]   $Generator    = "Visual Studio 16 2019",
+    # Empty = let CMake choose (-G omitted). Pass an explicit name to pin
+    # a Visual Studio version (e.g. "Visual Studio 16 2019").
+    [string]   $Generator    = "",
     [string]   $Architecture = "x64",
     [string[]] $CMakeArg     = @()
 )
@@ -277,8 +285,12 @@ $registerDshowVal    = if ($RegisterDShowFilter){ "ON" } else { "OFF" }
 
 $cmakeArgs = @(
     "-S", ".",
-    "-B", $BuildDir,
-    "-G", $Generator,
+    "-B", $BuildDir
+)
+if (-not [string]::IsNullOrWhiteSpace($Generator)) {
+    $cmakeArgs += "-G", $Generator
+}
+$cmakeArgs += @(
     "-A", $Architecture,
     "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile",
     "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet",
@@ -301,6 +313,22 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# When -Generator was omitted, report the generator CMake actually selected.
+$resolvedGenerator = $Generator
+if ([string]::IsNullOrWhiteSpace($resolvedGenerator)) {
+    $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
+    if (Test-Path $cacheFile) {
+        $gLine = Select-String -LiteralPath $cacheFile -Pattern '^CMAKE_GENERATOR:INTERNAL=' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($gLine) {
+            $resolvedGenerator = ($gLine.Line -replace '^CMAKE_GENERATOR:INTERNAL=', '')
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($resolvedGenerator)) {
+        $resolvedGenerator = "(CMake default; see CMakeCache.txt)"
+    }
+}
+
 # Persist the build dir so a future helper script (or the user) can reuse it
 # without retyping it. POSIX side does the same with config.mk; ours is just
 # a one-liner ps1 sourced via dot-source.
@@ -318,7 +346,7 @@ Selected client: $ClientType
 Install prefix : $Prefix
 Plugin version : $WithVersion
 Build dir      : $BuildDir
-Generator      : $Generator $Architecture
+Generator      : $resolvedGenerator $Architecture
 vcpkg toolchain: $ToolchainFile  ($VcpkgTriplet)
 
 Next steps:
